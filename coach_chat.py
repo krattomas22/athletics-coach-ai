@@ -306,25 +306,22 @@ with col1:
         if st.session_state.index is None:
             st.warning("Zdroje nejsou načtené – klikni na 'Znovu načíst & vybuildit index'.")
         else:
-            topk = search_similar(q, k=6)
-            ctx_blocks = []
-            for d in topk:
-                meta = d["meta"]
-                ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
-                ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
-            prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
-            client = st.session_state.openai_client
-            resp = safe_chat_completion(
-    client=st.session_state.openai_client,
-    model=MODEL_CHAT,
-    messages=[
-        {"role":"system","content":SYS_RAG},
-        {"role":"user","content":prompt},
-    ],
-    temperature=0.2,
-)
+    topk = search_similar(q, k=6)
+    ctx_blocks = []
+    for d in topk:
+        meta = d["meta"]
+        ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
+        ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
+    prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
+    client = st.session_state.openai_client
+    resp = safe_chat_completion(
+        client=client,
+        messages=[{"role": "system", "content": SYS_RAG},
+                  {"role": "user", "content": prompt}],
+        model=MODEL_CHAT,
+        temperature=0.2
+    )
 
-            st.markdown(resp.choices[0].message.content)
 
 with col2:
     st.subheader("🌦️ Počasí & plán")
@@ -373,6 +370,7 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json"
     )
+
 
 
 
