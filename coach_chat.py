@@ -302,11 +302,27 @@ col1, col2 = st.columns([2,1])
 with col1:
     st.subheader("💬 Chat nad přednačtenými zdroji (assets)")
     q = st.text_input("Zeptej se na cokoliv z metodiky…", placeholder="Např. Jak progresovat sprinty u U13 v zimě?")
-    if st.button("Odeslat dotaz") and q.strip():
-        if st.session_state.index is None:
-            st.warning("Zdroje nejsou načtené – klikni na 'Znovu načíst & vybuildit index'.")
-        else:
+    if st.session_state.index is None:
+    st.warning("Nejdřív nahraj zdroje a postav index.")
+else:
     topk = search_similar(q, k=6)
+    ctx_blocks = []
+    for d in topk:
+        meta = d["meta"]
+        ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
+        ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
+    prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
+    client = st.session_state.openai_client
+    resp = safe_chat_completion(
+        client=client,
+        messages=[
+            {"role": "system", "content": SYS_RAG},
+            {"role": "user", "content": prompt},
+        ],
+        model=MODEL_CHAT,
+        temperature=0.2,
+    )
+    st.markdown(resp.choices[0].message.content))
     ctx_blocks = []
     for d in topk:
         meta = d["meta"]
@@ -370,6 +386,7 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json"
     )
+
 
 
 
