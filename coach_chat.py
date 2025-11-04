@@ -38,7 +38,10 @@ if "emb_model" not in st.session_state:
     # lazy-load kvůli paměti
     st.session_state.emb_model = None
 if "openai_client" not in st.session_state:
-    def safe_chat_completion(client, messages, model, temperature=0.2, max_retries=4):
+    st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def safe_chat_completion(client, messages, model, temperature=0.2, max_retries=4):
     """
     Zavolá OpenAI Chat s automatickým retry při RateLimitError.
     Exponenciální backoff: 1s, 2s, 4s, 8s…
@@ -63,6 +66,7 @@ if "openai_client" not in st.session_state:
             st.info("Dočasná chyba služby – opakuji požadavek…")
             time.sleep(delay)
             delay *= 2
+
 
     st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
 if "assets_loaded" not in st.session_state:
@@ -369,5 +373,6 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json"
     )
+
 
 
