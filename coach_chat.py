@@ -29,8 +29,7 @@ ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")  # <-- sem dávej
 # ========== UI HLAVIČKA ==========
 st.set_page_config(page_title="Athletics Coach AI", page_icon="🏃", layout="wide")
 st.title("🏃‍♂️ Athletics Coach – RAG Chat + Tréninkový plánovač")
-# načti zdroje z assets/ a postav index (jen 1×)
-load_assets_if_needed()
+
 # ========== STAV A POMOCNÉ ==========
 if "docs" not in st.session_state:
     st.session_state.docs = []  # list[dict]: {id, text, meta}
@@ -444,4 +443,5 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json",
     )
+
 
