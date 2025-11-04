@@ -1,0 +1,317 @@
+import os, io, zipfile, json, time, tempfile, hashlib
+from datetime import datetime, date
+from typing import List, Dict, Any, Tuple
+
+import streamlit as st
+import requests
+from pypdf import PdfReader
+from PIL import Image
+import pytesseract
+
+# --- Embeddings & Vector DB ---
+import faiss
+from sentence_transformers import SentenceTransformer
+
+# --- LLM (OpenAI jako příklad, můžeš vyměnit) ---
+from openai import OpenAI
+
+# ========== KONFIG ==========
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "PASTE_YOUR_KEY")
+
+DEFAULT_CITY = "České Budějovice"
+MODEL_EMB = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # umí dobře česky
+MODEL_CHAT = "gpt-4o-mini"  # nebo jiný dle dostupnosti
+
+# ========== UI HLAVIČKA ==========
+st.set_page_config(page_title="Athletics Coach AI", page_icon="🏃", layout="wide")
+st.title("🏃‍♂️ Athletics Coach – RAG Chat + Tréninkový plánovač")
+
+# ========== STAV A POMOCNÉ ==========
+if "docs" not in st.session_state:
+    st.session_state.docs = []  # list[dict]: {id, text, meta}
+if "index" not in st.session_state:
+    st.session_state.index = None
+if "emb_model" not in st.session_state:
+    st.session_state.emb_model = SentenceTransformer(MODEL_EMB)
+if "openai_client" not in st.session_state:
+    st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
+
+def hash_text(t: str) -> str:
+    return hashlib.sha1(t.encode("utf-8")).hexdigest()[:10]
+
+def clean_text(t: str) -> str:
+    return " ".join(t.replace("\n", " ").split())
+
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str]:
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk = words[i:i+chunk_size]
+        chunks.append(" ".join(chunk))
+        i += (chunk_size - overlap)
+    return chunks
+
+def embed_texts(texts: List[str]):
+    return st.session_state.emb_model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+
+def ensure_faiss(index_dim: int):
+    if st.session_state.index is None:
+        st.session_state.index = faiss.IndexFlatIP(index_dim)
+
+def add_to_corpus(text: str, source: str, page: int | None = None):
+    text = clean_text(text)
+    if not text.strip():
+        return []
+    chunks = chunk_text(text)
+    metas = []
+    for j, ch in enumerate(chunks):
+        metas.append({"source": source, "page": page, "chunk_id": j, "id": hash_text(f"{source}-{page}-{j}")})
+        st.session_state.docs.append({"id": metas[-1]["id"], "text": ch, "meta": metas[-1]})
+    return metas
+
+def build_or_update_index():
+    texts = [d["text"] for d in st.session_state.docs]
+    if not texts:
+        return
+    vecs = embed_texts(texts)
+    ensure_faiss(vecs.shape[1])
+    st.session_state.index.reset()
+    st.session_state.index.add(vecs)
+
+def search_similar(query: str, k: int = 5) -> List[Dict[str, Any]]:
+    if st.session_state.index is None or len(st.session_state.docs) == 0:
+        return []
+    qv = embed_texts([query])
+    D, I = st.session_state.index.search(qv, k)
+    out = []
+    for idx in I[0]:
+        if idx == -1:
+            continue
+        out.append(st.session_state.docs[idx])
+    return out
+
+# ========== INGEST: PDF ==========
+def ingest_pdf(file):
+    reader = PdfReader(file)
+    for i, page in enumerate(reader.pages):
+        try:
+            txt = page.extract_text() or ""
+        except Exception:
+            txt = ""
+        add_to_corpus(txt, source=f"PDF:{file.name}", page=i+1)
+    st.success(f"Načteno PDF: {file.name} ({len(reader.pages)} stran)")
+
+# ========== INGEST: ZIP s fotkami (OCR) ==========
+def is_image_name(n: str) -> bool:
+    n = n.lower()
+    return n.endswith(".jpg") or n.endswith(".jpeg") or n.endswith(".png") or n.endswith(".webp") or n.endswith(".tif")
+
+def ingest_zip(zip_bytes):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        names = [n for n in z.namelist() if is_image_name(n)]
+        if not names:
+            st.warning("V ZIPu nebyly nalezeny žádné obrázky.")
+            return
+        for n in names:
+            with z.open(n) as f:
+                img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                txt = pytesseract.image_to_string(img, lang="ces")
+                add_to_corpus(txt, source=f"ZIP:{n}", page=None)
+        st.success(f"OCR zpracováno: {len(names)} obrázků")
+
+# ========== POČASÍ (nová verze bez API klíče) ==========
+def get_weather(city: str = DEFAULT_CITY) -> dict:
+    import urllib.parse
+    city_encoded = urllib.parse.quote(city)
+    url = f"https://wttr.in/{city_encoded}?format=j1"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        current = data["current_condition"][0]
+        temp = float(current.get("temp_C", 0))
+        desc = current["weatherDesc"][0]["value"]
+        wind = float(current.get("windspeedKmph", 0))
+        precip = float(current.get("precipMM", 0))
+
+        return {
+            "city": city,
+            "temp": temp,
+            "desc": desc,
+            "wind": wind,
+            "precip": precip > 0,
+            "raw": data
+        }
+    except Exception:
+        return {
+            "city": city,
+            "temp": 10,
+            "desc": "nelze zjistit (offline data)",
+            "wind": 0,
+            "precip": False,
+            "raw": {}
+        }
+
+def weather_context(w: Dict[str, Any]) -> str:
+    if w["precip"] or w["temp"] <= 5:
+        return "indoor"
+    return "outdoor"
+
+# ========== DETERMINISTICKÝ PLÁNOVAČ ==========
+def periodization(date_: date, season_peak: date | None, micro_week: int, age: str) -> Dict[str, Any]:
+    deload = (micro_week % 4 == 0)
+    base_int = "střední" if not deload else "nízká"
+    return {"micro_week": micro_week, "deload": deload, "base_intensity": base_int, "age": age}
+
+def generate_plan(age_group: str, context: str, pz: Dict[str, Any], races: List[Dict[str, Any]]) -> Dict[str, Any]:
+    base_points = {"U11": 30, "U13": 40, "U15": 50}.get(age_group, 40)
+    if pz["deload"]:
+        base_points = int(base_points * 0.75)
+
+    warmup = [{"name": "běžecká abeceda", "duration": "10 min"},
+              {"name": "mobilita kotník/kyčle", "duration": "6 min"}]
+    if context == "indoor":
+        main = [{"name": "6×60 m technický sprint 85–90 %", "rest": "90 s"},
+                {"name": "rychlostní žebřík – koordinace", "duration": "8 min"}]
+    else:
+        main = [{"name": "6×80 m rovinky (80–90 %) s meziklusem", "rest": "120 s"},
+                {"name": "štafetové úseky 4×50 m (technika předávky)", "rest": "plná"}]
+
+    strength = [{"name": "core okruh (plank, hollow, side) 2×", "duration": "10 min"}]
+    cooldown = [{"name": "vyklus + strečink", "duration": "8 min"}]
+
+    return {
+        "goal": "rychlost + technika sprintu",
+        "intensity": pz["base_intensity"],
+        "volume_points": base_points,
+        "context": context,
+        "blocks": [
+            {"part": "Warm-up", "items": warmup},
+            {"part": "Main", "items": main},
+            {"part": "Strength", "items": strength},
+            {"part": "Cool-down", "items": cooldown},
+        ],
+        "safety": [
+            "Nepřetěžovat nad 90 % u 11–15 let.",
+            "Plná regenerace mezi opakováními.",
+            "V chladnu prodloužit rozcvičení."
+        ]
+    }
+
+# ========== PROMPTY ==========
+SYS_RAG = """Jsi asistent trenéra atletiky pro děti 11–15 let. Odpovídej stručně, česky.
+Vycházej primárně z poskytnutých výňatků (CONTEXT). Když si nejsi jistý, řekni to.
+Dbej na bezpečnost, techniku a věková omezení. Připojuj stručné reference (zdroj+strana/soubor)."""
+
+USR_RAG = """DOTAZ: {q}
+CONTEXT:
+{ctx}
+POKYN: Odpověz výhradně na základě CONTEXTU. Pokud něco není ve zdrojích, řekni to.
+"""
+
+SYS_PLAN = """Jsi trenér, který přetaví strukturovaný plán (JSON) do čitelného tréninku pro děti 11–15 let.
+Dodrž intenzitu a objem. Nabídni 1 indoor/outdoor alternativu, pokud kontext nedává smysl.
+Nakonec přidej krátké 'Proč takto' a 'Bezpečnost'. Piš česky a stručně."""
+
+USR_PLAN = """ZÁKLAD:
+{base}
+
+METADATA:
+- Věk: {age}
+- Město/počasí: {city_desc}
+- Mikrocyklus: {micro_week} (deload: {deload})
+
+POKYN:
+Sepiš 1 tréninkovou jednotku (rozcvičení → hlavní část → doplňky → cool-down),
+zachovej názvy a parametry. Přidej 1 alternativu (indoor/outdoor).
+"""
+
+# ========== SIDEBAR – UPLOAD ==========
+st.sidebar.header("📚 Zdroje")
+pdf_files = st.sidebar.file_uploader("PDF s metodikou/knihou", accept_multiple_files=True, type=["pdf"])
+if pdf_files:
+    for f in pdf_files:
+        ingest_pdf(f)
+
+zip_file = st.sidebar.file_uploader("ZIP s fotkami stránek (OCR)", type=["zip"])
+if zip_file is not None:
+    ingest_zip(zip_file.read())
+
+if st.sidebar.button("🔎 Vybuildit index"):
+    build_or_update_index()
+    st.sidebar.success("Index připraven ✅")
+
+# ========== PRAVÝ PANEL – NASTAVENÍ ==========
+st.sidebar.header("⚙️ Nastavení plánu")
+age_group = st.sidebar.selectbox("Věk/skupina", ["U11", "U13", "U15"], index=1)
+micro_week = st.sidebar.number_input("Týden mikrocyklu (1–4)", min_value=1, max_value=4, value=3)
+city = st.sidebar.text_input("Město (počasí)", value=DEFAULT_CITY)
+races_str = st.sidebar.text_area("Kalendář závodů (JSON list)", value='[{"date":"2025-11-22","disciplines":["60m","dálka"]}]')
+
+# ========== HLAVNÍ – CHAT ==========
+col1, col2 = st.columns([2,1])
+
+with col1:
+    st.subheader("💬 Chat nad tvými zdroji")
+    q = st.text_input("Zeptej se na cokoliv z knihy/metodiky…", placeholder="Např. Jak progresovat sprinty u U13 v zimě?")
+    if st.button("Odeslat dotaz") and q.strip():
+        if st.session_state.index is None:
+            st.warning("Nejdřív nahraj zdroje a postav index.")
+        else:
+            topk = search_similar(q, k=6)
+            ctx_blocks = []
+            for d in topk:
+                meta = d["meta"]
+                ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
+                ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
+            prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
+            client = st.session_state.openai_client
+            resp = client.chat.completions.create(
+                model=MODEL_CHAT,
+                messages=[{"role":"system","content":SYS_RAG},
+                          {"role":"user","content":prompt}],
+                temperature=0.2,
+            )
+            st.markdown(resp.choices[0].message.content)
+
+with col2:
+    st.subheader("🌦️ Počasí & plán")
+    try:
+        w = get_weather(city)
+        st.metric("Teplota", f"{w['temp']} °C")
+        st.caption(f"{w['city']}: {w['desc']} | vítr {w['wind']} km/h")
+        st.markdown("[🌦 Zobrazit radar na pocasiaradar.cz](https://www.pocasiaradar.cz/)")
+        ctx = weather_context(w)
+    except Exception as e:
+        st.warning("Nelze načíst počasí – používám offline hodnoty.")
+        w, ctx = {"city": city, "temp": 10, "desc":"offline data", "wind":0}, "indoor"
+
+    try:
+        races = json.loads(races_str)
+    except:
+        races = []
+    pz = periodization(date.today(), None, micro_week, age_group)
+    base_plan = generate_plan(age_group, ctx, pz, races)
+
+    st.json(base_plan, expanded=False)
+
+    if st.button("🧠 Vygenerovat čitelnou verzi"):
+        client = st.session_state.openai_client
+        city_desc = f"{w['city']}: {w['desc']} ({w['temp']} °C)"
+        prompt = USR_PLAN.format(
+            base=json.dumps(base_plan, ensure_ascii=False, indent=2),
+            age=age_group, city_desc=city_desc,
+            micro_week=pz["micro_week"], deload=pz["deload"]
+        )
+        resp = client.chat.completions.create(
+            model=MODEL_CHAT,
+            messages=[{"role":"system","content":SYS_PLAN},
+                      {"role":"user","content":prompt}],
+            temperature=0.3,
+        )
+        st.markdown(resp.choices[0].message.content)
+
+    st.download_button("⬇️ Stáhnout plán (JSON)", data=json.dumps(base_plan, ensure_ascii=False, indent=2),
+                       file_name=f"plan_{date.today().isoformat()}.json", mime="application/json")

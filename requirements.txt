@@ -1,0 +1,8 @@
+streamlit
+pypdf
+faiss-cpu
+sentence-transformers
+pillow
+pytesseract
+openai
+requests
