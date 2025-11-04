@@ -1,4 +1,5 @@
 import os, io, zipfile, json, hashlib
+import random  # pro jitter v backoffu
 from datetime import date
 from typing import List, Dict, Any
 
@@ -28,7 +29,8 @@ ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")  # <-- sem dávej
 # ========== UI HLAVIČKA ==========
 st.set_page_config(page_title="Athletics Coach AI", page_icon="🏃", layout="wide")
 st.title("🏃‍♂️ Athletics Coach – RAG Chat + Tréninkový plánovač")
-
+# načti zdroje z assets/ a postav index (jen 1×)
+load_assets_if_needed()
 # ========== STAV A POMOCNÉ ==========
 if "docs" not in st.session_state:
     st.session_state.docs = []  # list[dict]: {id, text, meta}
@@ -40,11 +42,10 @@ if "emb_model" not in st.session_state:
 if "openai_client" not in st.session_state:
     st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-def safe_chat_completion(client, messages, model, temperature=0.2, max_retries=4):
+def safe_chat_completion(client, messages, model, temperature=0.2, max_retries=6):
     """
-    Zavolá OpenAI Chat s automatickým retry při RateLimitError.
-    Exponenciální backoff: 1s, 2s, 4s, 8s…
+    Volá OpenAI Chat s automatickým retry při RateLimitError/APIError.
+    Exponenciální backoff + náhodný jitter: 1s → 2s → 4s → 8s → 12s → 16s (+0–1s).
     """
     delay = 1.0
     for attempt in range(max_retries):
@@ -57,18 +58,18 @@ def safe_chat_completion(client, messages, model, temperature=0.2, max_retries=4
         except RateLimitError:
             if attempt == max_retries - 1:
                 raise
-            st.info(f"⏳ Limit API – zkouším znovu za {int(delay)}s…")
-            time.sleep(delay)
-            delay *= 2
+            sleep_for = delay + random.uniform(0, 1)
+            st.info(f"⏳ Limit API – zkusím znovu za {sleep_for:.1f} s…")
+            time.sleep(sleep_for)
+            delay = min(delay * 2, 16)
         except APIError:
             if attempt == max_retries - 1:
                 raise
-            st.info("Dočasná chyba služby – opakuji požadavek…")
-            time.sleep(delay)
-            delay *= 2
+            sleep_for = delay + random.uniform(0, 1)
+            st.info("⚠️ Dočasná chyba služby – opakuji požadavek…")
+            time.sleep(sleep_for)
+            delay = min(delay * 2, 16)
 
-
-    st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
 if "assets_loaded" not in st.session_state:
     st.session_state.assets_loaded = False
 
@@ -115,6 +116,65 @@ def build_or_update_index():
     ensure_faiss(vecs.shape[1])
     st.session_state.index.reset()
     st.session_state.index.add(vecs)
+
+def _is_image_name(n: str) -> bool:
+    n = n.lower()
+    return n.endswith((".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"))
+
+def load_assets_if_needed():
+    """
+    Načte všechny PDF a ZIP (s fotkami stránek) z adresáře ASSETS_DIR, jednou.
+    """
+    if st.session_state.assets_loaded:
+        return
+    if not os.path.isdir(ASSETS_DIR):
+        st.warning(f"Adresář assets nenalezen: {ASSETS_DIR}")
+        return
+
+    loaded_pages = 0
+    loaded_imgs = 0
+
+    with st.spinner("Načítám zdroje z assets/…"):
+        for name in sorted(os.listdir(ASSETS_DIR)):
+            path = os.path.join(ASSETS_DIR, name)
+            if not os.path.isfile(path):
+                continue
+
+            # PDF -> vytěžit text
+            if name.lower().endswith(".pdf"):
+                try:
+                    reader = PdfReader(path)
+                    for i, page in enumerate(reader.pages):
+                        try:
+                            txt = page.extract_text() or ""
+                        except Exception:
+                            txt = ""
+                        add_to_corpus(txt, source=f"PDF:{name}", page=i+1)
+                        loaded_pages += 1
+                except Exception as e:
+                    st.warning(f"PDF se nepodařilo načíst ({name}): {e}")
+
+            # ZIP -> OCR z obrázků
+            elif name.lower().endswith(".zip"):
+                try:
+                    with zipfile.ZipFile(path, "r") as z:
+                        for n in z.namelist():
+                            if not _is_image_name(n):
+                                continue
+                            with z.open(n) as f:
+                                try:
+                                    img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                                    txt = pytesseract.image_to_string(img, lang="ces")
+                                except Exception:
+                                    txt = ""
+                                add_to_corpus(txt, source=f"ZIP:{name}/{n}", page=None)
+                                loaded_imgs += 1
+                except Exception as e:
+                    st.warning(f"ZIP se nepodařilo načíst ({name}): {e}")
+
+    build_or_update_index()
+    st.session_state.assets_loaded = True
+    st.success(f"Zdroje načteny ✅ (PDF stránek: {loaded_pages}, OCR obrázků: {loaded_imgs})")
 
 def search_similar(query: str, k: int = 5) -> List[Dict[str, Any]]:
     if st.session_state.index is None or len(st.session_state.docs) == 0:
@@ -384,3 +444,4 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json",
     )
+
