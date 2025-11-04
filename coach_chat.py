@@ -302,43 +302,35 @@ col1, col2 = st.columns([2,1])
 with col1:
     st.subheader("💬 Chat nad přednačtenými zdroji (assets)")
     q = st.text_input("Zeptej se na cokoliv z metodiky…", placeholder="Např. Jak progresovat sprinty u U13 v zimě?")
-    if st.session_state.index is None:
-    st.warning("Nejdřív nahraj zdroje a postav index.")
-else:
-    topk = search_similar(q, k=6)
-    ctx_blocks = []
-    for d in topk:
-        meta = d["meta"]
-        ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
-        ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
-    prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
-    client = st.session_state.openai_client
-    resp = safe_chat_completion(
-        client=client,
-        messages=[
-            {"role": "system", "content": SYS_RAG},
-            {"role": "user", "content": prompt},
-        ],
-        model=MODEL_CHAT,
-        temperature=0.2,
-    )
-    st.markdown(resp.choices[0].message.content)
-    ctx_blocks = []
-    for d in topk:
-        meta = d["meta"]
-        ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
-        ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
-    prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
-    client = st.session_state.openai_client
-    resp = safe_chat_completion(
-        client=client,
-        messages=[{"role": "system", "content": SYS_RAG},
-                  {"role": "user", "content": prompt}],
-        model=MODEL_CHAT,
-        temperature=0.2
-    )
 
+    if st.button("Odeslat dotaz") and q.strip():
+    # 1) chybí klíč?
+    if st.session_state.openai_client is None:
+        st.warning("Nejdřív doplň `OPENAI_API_KEY` do Settings → Secrets.")
+    # 2) není postavený index?
+    elif st.session_state.index is None:
+        st.warning("Nejdřív načti zdroje z assets a postav index (tlačítko vlevo).")
+    # 3) všechno OK → vyhledat kontext a zavolat model
+    else:
+        topk = search_similar(q, k=6)
+        ctx_blocks = []
+        for d in topk:
+            meta = d["meta"]
+            ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
+            ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
 
+        prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
+
+        resp = safe_chat_completion(
+            client=st.session_state.openai_client,
+            model=MODEL_CHAT,
+            messages=[
+                {"role": "system", "content": SYS_RAG},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.2,
+        )
+        st.markdown(resp.choices[0].message.content)
 with col2:
     st.subheader("🌦️ Počasí & plán")
     try:
@@ -386,6 +378,7 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json"
     )
+
 
 
 
