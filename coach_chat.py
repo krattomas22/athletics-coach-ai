@@ -322,7 +322,7 @@ else:
         model=MODEL_CHAT,
         temperature=0.2,
     )
-    st.markdown(resp.choices[0].message.content))
+    st.markdown(resp.choices[0].message.content)
     ctx_blocks = []
     for d in topk:
         meta = d["meta"]
@@ -386,6 +386,7 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json"
     )
+
 
 
 
