@@ -1,6 +1,6 @@
-import os, io, zipfile, json, hashlib
-from datetime import date
-from typing import List, Dict, Any
+import os, io, zipfile, json, time, tempfile, hashlib
+from datetime import datetime, date
+from typing import List, Dict, Any, Tuple
 
 import streamlit as st
 import requests
@@ -16,18 +16,15 @@ from sentence_transformers import SentenceTransformer
 from openai import OpenAI
 
 # ========== KONFIG ==========
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "PASTE_YOUR_KEY")  # nastav ve Streamlit Secrets pro sdílení
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "PASTE_YOUR_KEY")
 
 DEFAULT_CITY = "České Budějovice"
-MODEL_EMB = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # česky OK
-MODEL_CHAT = "gpt-4o-mini"  # libovolný kompatibilní model
-
-APP_TITLE = "Tréninkový plánovač"
-ASSETS_DIR = os.path.join(os.path.dirname(__file__), "assets")  # sem dej svá PDF/ZIP se zdroji
+MODEL_EMB = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # umí dobře česky
+MODEL_CHAT = "gpt-4o-mini"  # nebo jiný dle dostupnosti
 
 # ========== UI HLAVIČKA ==========
-st.set_page_config(page_title=APP_TITLE, page_icon="🏃", layout="wide")
-st.title(APP_TITLE)
+st.set_page_config(page_title="Athletics Coach AI", page_icon="🏃", layout="wide")
+st.title("🏃‍♂️ Athletics Coach – RAG Chat + Tréninkový plánovač")
 
 # ========== STAV A POMOCNÉ ==========
 if "docs" not in st.session_state:
@@ -35,11 +32,9 @@ if "docs" not in st.session_state:
 if "index" not in st.session_state:
     st.session_state.index = None
 if "emb_model" not in st.session_state:
-    st.session_state.emb_model = None  # lazy-load
+    st.session_state.emb_model = SentenceTransformer(MODEL_EMB)
 if "openai_client" not in st.session_state:
     st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
-if "assets_loaded" not in st.session_state:
-    st.session_state.assets_loaded = False
 
 def hash_text(t: str) -> str:
     return hashlib.sha1(t.encode("utf-8")).hexdigest()[:10]
@@ -58,9 +53,6 @@ def chunk_text(text: str, chunk_size: int = 800, overlap: int = 100) -> List[str
     return chunks
 
 def embed_texts(texts: List[str]):
-    if st.session_state.emb_model is None:
-        with st.spinner("Načítám embedding model…"):
-            st.session_state.emb_model = SentenceTransformer(MODEL_EMB)
     return st.session_state.emb_model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
 
 def ensure_faiss(index_dim: int):
@@ -72,9 +64,11 @@ def add_to_corpus(text: str, source: str, page: int | None = None):
     if not text.strip():
         return []
     chunks = chunk_text(text)
+    metas = []
     for j, ch in enumerate(chunks):
-        meta = {"source": source, "page": page, "chunk_id": j, "id": hash_text(f"{source}-{page}-{j}")}
-        st.session_state.docs.append({"id": meta["id"], "text": ch, "meta": meta})
+        metas.append({"source": source, "page": page, "chunk_id": j, "id": hash_text(f"{source}-{page}-{j}")})
+        st.session_state.docs.append({"id": metas[-1]["id"], "text": ch, "meta": metas[-1]})
+    return metas
 
 def build_or_update_index():
     texts = [d["text"] for d in st.session_state.docs]
@@ -97,62 +91,36 @@ def search_similar(query: str, k: int = 5) -> List[Dict[str, Any]]:
         out.append(st.session_state.docs[idx])
     return out
 
-# ========== INGEST: PDF / ZIP z assets ==========
+# ========== INGEST: PDF ==========
+def ingest_pdf(file):
+    reader = PdfReader(file)
+    for i, page in enumerate(reader.pages):
+        try:
+            txt = page.extract_text() or ""
+        except Exception:
+            txt = ""
+        add_to_corpus(txt, source=f"PDF:{file.name}", page=i+1)
+    st.success(f"Načteno PDF: {file.name} ({len(reader.pages)} stran)")
+
+# ========== INGEST: ZIP s fotkami (OCR) ==========
 def is_image_name(n: str) -> bool:
     n = n.lower()
-    return n.endswith((".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff"))
+    return n.endswith(".jpg") or n.endswith(".jpeg") or n.endswith(".png") or n.endswith(".webp") or n.endswith(".tif")
 
-def ingest_pdf_path(path: str, label: str):
-    try:
-        with open(path, "rb") as f:
-            reader = PdfReader(f)
-            for i, page in enumerate(reader.pages):
-                try:
-                    txt = page.extract_text() or ""
-                except Exception:
-                    txt = ""
-                add_to_corpus(txt, source=f"PDF:{os.path.basename(label)}", page=i+1)
-        return True
-    except Exception as e:
-        st.warning(f"PDF nelze načíst ({path}): {e}")
-        return False
+def ingest_zip(zip_bytes):
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        names = [n for n in z.namelist() if is_image_name(n)]
+        if not names:
+            st.warning("V ZIPu nebyly nalezeny žádné obrázky.")
+            return
+        for n in names:
+            with z.open(n) as f:
+                img = Image.open(io.BytesIO(f.read())).convert("RGB")
+                txt = pytesseract.image_to_string(img, lang="ces")
+                add_to_corpus(txt, source=f"ZIP:{n}", page=None)
+        st.success(f"OCR zpracováno: {len(names)} obrázků")
 
-def ingest_zip_path(path: str, label: str):
-    try:
-        with zipfile.ZipFile(path, "r") as z:
-            names = [n for n in z.namelist() if is_image_name(n)]
-            if not names:
-                st.info(f"V ZIPu {label} nejsou obrázky.")
-                return True
-            for n in names:
-                with z.open(n) as f:
-                    img = Image.open(io.BytesIO(f.read())).convert("RGB")
-                    txt = pytesseract.image_to_string(img, lang="ces")
-                    add_to_corpus(txt, source=f"ZIP:{label}/{n}", page=None)
-        return True
-    except Exception as e:
-        st.warning(f"ZIP nelze načíst ({path}): {e}")
-        return False
-
-def load_assets_once():
-    if st.session_state.assets_loaded:
-        return
-    loaded_any = False
-    if os.path.isdir(ASSETS_DIR):
-        # Načti všechna PDF
-        for name in os.listdir(ASSETS_DIR):
-            p = os.path.join(ASSETS_DIR, name)
-            if name.lower().endswith(".pdf"):
-                ok = ingest_pdf_path(p, name)
-                loaded_any = loaded_any or ok
-            elif name.lower().endswith(".zip"):
-                ok = ingest_zip_path(p, name)
-                loaded_any = loaded_any or ok
-    if loaded_any:
-        build_or_update_index()
-        st.session_state.assets_loaded = True
-
-# ========== POČASÍ (wttr.in bez klíče) ==========
+# ========== POČASÍ (nová verze bez API klíče) ==========
 def get_weather(city: str = DEFAULT_CITY) -> dict:
     import urllib.parse
     city_encoded = urllib.parse.quote(city)
@@ -168,47 +136,48 @@ def get_weather(city: str = DEFAULT_CITY) -> dict:
         wind = float(current.get("windspeedKmph", 0))
         precip = float(current.get("precipMM", 0))
 
-        return {"city": city, "temp": temp, "desc": desc, "wind": wind, "precip": precip > 0, "raw": data}
+        return {
+            "city": city,
+            "temp": temp,
+            "desc": desc,
+            "wind": wind,
+            "precip": precip > 0,
+            "raw": data
+        }
     except Exception:
-        return {"city": city, "temp": 10, "desc": "nelze zjistit (offline data)", "wind": 0, "precip": False, "raw": {}}
+        return {
+            "city": city,
+            "temp": 10,
+            "desc": "nelze zjistit (offline data)",
+            "wind": 0,
+            "precip": False,
+            "raw": {}
+        }
 
 def weather_context(w: Dict[str, Any]) -> str:
-    wind_ms = w["wind"] / 3.6 if isinstance(w["wind"], (int, float)) else 0.0
-    cold = (w["temp"] is not None) and (w["temp"] <= 5)
-    windy = wind_ms >= 8.0  # ~28.8 km/h
-    wet = bool(w["precip"])
-    return "indoor" if cold or windy or wet else "outdoor"
+    if w["precip"] or w["temp"] <= 5:
+        return "indoor"
+    return "outdoor"
 
 # ========== DETERMINISTICKÝ PLÁNOVAČ ==========
-def periodization(sessions_per_week: int, age: str) -> Dict[str, Any]:
-    # jednoduché meta: intenzita dle věku + počtu jednotek
-    base_int = "střední"
-    if sessions_per_week <= 2:
-        base_int = "nízká"
-    elif sessions_per_week >= 4:
-        base_int = "středně-vysoká"
-    return {"sessions_per_week": sessions_per_week, "base_intensity": base_int, "age": age}
+def periodization(date_: date, season_peak: date | None, micro_week: int, age: str) -> Dict[str, Any]:
+    deload = (micro_week % 4 == 0)
+    base_int = "střední" if not deload else "nízká"
+    return {"micro_week": micro_week, "deload": deload, "base_intensity": base_int, "age": age}
 
 def generate_plan(age_group: str, context: str, pz: Dict[str, Any], races: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # objemové body dle věku
-    base_points_map = {"U14 (do 13)": 40, "U16 (do 15)": 55}
-    base_points = base_points_map.get(age_group, 45)
+    base_points = {"U11": 30, "U13": 40, "U15": 50}.get(age_group, 40)
+    if pz["deload"]:
+        base_points = int(base_points * 0.75)
 
-    # uprava dle počtu jednotek v týdnu (orientačně)
-    spw = pz["sessions_per_week"]
-    if spw <= 2:
-        base_points = int(base_points * 0.8)
-    elif spw >= 4:
-        base_points = int(base_points * 1.1)
-
-    warmup = [{"name": "běžecká abeceda", "duration": "8–10 min"},
+    warmup = [{"name": "běžecká abeceda", "duration": "10 min"},
               {"name": "mobilita kotník/kyčle", "duration": "6 min"}]
     if context == "indoor":
-        main = [{"name": "6×50–60 m technický sprint 85–90 %", "rest": "90 s"},
-                {"name": "koordinační žebřík", "duration": "8 min"}]
+        main = [{"name": "6×60 m technický sprint 85–90 %", "rest": "90 s"},
+                {"name": "rychlostní žebřík – koordinace", "duration": "8 min"}]
     else:
         main = [{"name": "6×80 m rovinky (80–90 %) s meziklusem", "rest": "120 s"},
-                {"name": "štaf. předávky 4×50 m (technika)", "rest": "plná"}]
+                {"name": "štafetové úseky 4×50 m (technika předávky)", "rest": "plná"}]
 
     strength = [{"name": "core okruh (plank, hollow, side) 2×", "duration": "10 min"}]
     cooldown = [{"name": "vyklus + strečink", "duration": "8 min"}]
@@ -218,7 +187,6 @@ def generate_plan(age_group: str, context: str, pz: Dict[str, Any], races: List[
         "intensity": pz["base_intensity"],
         "volume_points": base_points,
         "context": context,
-        "sessions_per_week": spw,
         "blocks": [
             {"part": "Warm-up", "items": warmup},
             {"part": "Main", "items": main},
@@ -229,8 +197,7 @@ def generate_plan(age_group: str, context: str, pz: Dict[str, Any], races: List[
             "Nepřetěžovat nad 90 % u 11–15 let.",
             "Plná regenerace mezi opakováními.",
             "V chladnu prodloužit rozcvičení."
-        ],
-        "races_hint": races[:3] if races else []
+        ]
     }
 
 # ========== PROMPTY ==========
@@ -254,66 +221,44 @@ USR_PLAN = """ZÁKLAD:
 METADATA:
 - Věk: {age}
 - Město/počasí: {city_desc}
-- Počet tréninků v týdnu: {spw}
+- Mikrocyklus: {micro_week} (deload: {deload})
 
 POKYN:
 Sepiš 1 tréninkovou jednotku (rozcvičení → hlavní část → doplňky → cool-down),
 zachovej názvy a parametry. Přidej 1 alternativu (indoor/outdoor).
 """
 
-# ========== LEVÝ PANEL – INFO O ZDROJÍCH ==========
+# ========== SIDEBAR – UPLOAD ==========
 st.sidebar.header("📚 Zdroje")
-st.sidebar.success("Zdroje jsou **přednačtené** ze složky `assets/` (PDF/ZIP).")
-if st.sidebar.button("🔎 Znovu vybuildit index"):
-    st.session_state.assets_loaded = False
-    load_assets_once()
+pdf_files = st.sidebar.file_uploader("PDF s metodikou/knihou", accept_multiple_files=True, type=["pdf"])
+if pdf_files:
+    for f in pdf_files:
+        ingest_pdf(f)
+
+zip_file = st.sidebar.file_uploader("ZIP s fotkami stránek (OCR)", type=["zip"])
+if zip_file is not None:
+    ingest_zip(zip_file.read())
+
+if st.sidebar.button("🔎 Vybuildit index"):
+    build_or_update_index()
     st.sidebar.success("Index připraven ✅")
 
 # ========== PRAVÝ PANEL – NASTAVENÍ ==========
 st.sidebar.header("⚙️ Nastavení plánu")
-age_group = st.sidebar.selectbox("Věk/skupina", ["U14 (do 13)", "U16 (do 15)"], index=0)
-sessions_per_week = st.sidebar.number_input("Počet tréninků v týdnu", min_value=1, max_value=7, value=3)
+age_group = st.sidebar.selectbox("Věk/skupina", ["U11", "U13", "U15"], index=1)
+micro_week = st.sidebar.number_input("Týden mikrocyklu (1–4)", min_value=1, max_value=4, value=3)
 city = st.sidebar.text_input("Město (počasí)", value=DEFAULT_CITY)
+races_str = st.sidebar.text_area("Kalendář závodů (JSON list)", value='[{"date":"2025-11-22","disciplines":["60m","dálka"]}]')
 
-# Kalendář závodů – DOCX upload (volitelně)
-import docx
-def parse_races_docx(file_obj) -> List[Dict[str, Any]]:
-    """Čeká řádky typu: 2025-11-22: 60m, dálka"""
-    races = []
-    try:
-        doc = docx.Document(file_obj)
-        for p in doc.paragraphs:
-            line = p.text.strip()
-            if not line:
-                continue
-            if ":" in line:
-                date_str, rest = line.split(":", 1)
-                date_str = date_str.strip()
-                discs = [d.strip() for d in rest.split(",") if d.strip()]
-                races.append({"date": date_str, "disciplines": discs})
-    except Exception:
-        pass
-    return races
-
-st.sidebar.markdown("**Kalendář závodů (volitelné, DOCX)** – každý řádek `YYYY-MM-DD: 60m, dálka`")
-races_docx = st.sidebar.file_uploader("Nahrát DOCX", type=["docx"])
-if races_docx:
-    races = parse_races_docx(races_docx)
-else:
-    races = [{"date": "2025-11-22", "disciplines": ["60m", "dálka"]}]
-
-# ========== HLAVNÍ – CHAT a PLÁN ==========
-# Načti assets a index jednou
-load_assets_once()
-
+# ========== HLAVNÍ – CHAT ==========
 col1, col2 = st.columns([2,1])
 
 with col1:
-    st.subheader("💬 Chat nad tvými (přednačtenými) zdroji")
-    q = st.text_input("Zeptej se na cokoliv z metodiky…", placeholder="Např. Jak progresovat sprinty u U14 v zimě?")
+    st.subheader("💬 Chat nad tvými zdroji")
+    q = st.text_input("Zeptej se na cokoliv z knihy/metodiky…", placeholder="Např. Jak progresovat sprinty u U13 v zimě?")
     if st.button("Odeslat dotaz") and q.strip():
         if st.session_state.index is None:
-            st.warning("Zdroje nejsou načtené – klikni na 'Znovu vybuildit index'.")
+            st.warning("Nejdřív nahraj zdroje a postav index.")
         else:
             topk = search_similar(q, k=6)
             ctx_blocks = []
@@ -333,16 +278,21 @@ with col1:
 
 with col2:
     st.subheader("🌦️ Počasí & plán")
-    # počasí
-    w = get_weather(city)
-    st.metric("Teplota", f"{w['temp']} °C")
-    wind_ms = w['wind']/3.6 if isinstance(w['wind'], (int,float)) else 0.0
-    st.caption(f"{w['city']}: {w['desc']} | vítr {wind_ms:.1f} m/s")
-    st.markdown("[🌦 Zobrazit radar na pocasiaradar.cz](https://www.pocasiaradar.cz/)")
-    ctx = weather_context(w)
+    try:
+        w = get_weather(city)
+        st.metric("Teplota", f"{w['temp']} °C")
+        st.caption(f"{w['city']}: {w['desc']} | vítr {w['wind']} km/h")
+        st.markdown("[🌦 Zobrazit radar na pocasiaradar.cz](https://www.pocasiaradar.cz/)")
+        ctx = weather_context(w)
+    except Exception as e:
+        st.warning("Nelze načíst počasí – používám offline hodnoty.")
+        w, ctx = {"city": city, "temp": 10, "desc":"offline data", "wind":0}, "indoor"
 
-    # periodizace a plán
-    pz = periodization(sessions_per_week, age_group)
+    try:
+        races = json.loads(races_str)
+    except:
+        races = []
+    pz = periodization(date.today(), None, micro_week, age_group)
     base_plan = generate_plan(age_group, ctx, pz, races)
 
     st.json(base_plan, expanded=False)
@@ -352,9 +302,8 @@ with col2:
         city_desc = f"{w['city']}: {w['desc']} ({w['temp']} °C)"
         prompt = USR_PLAN.format(
             base=json.dumps(base_plan, ensure_ascii=False, indent=2),
-            age=age_group,
-            city_desc=city_desc,
-            spw=pz["sessions_per_week"],
+            age=age_group, city_desc=city_desc,
+            micro_week=pz["micro_week"], deload=pz["deload"]
         )
         resp = client.chat.completions.create(
             model=MODEL_CHAT,
@@ -364,9 +313,5 @@ with col2:
         )
         st.markdown(resp.choices[0].message.content)
 
-    st.download_button(
-        "⬇️ Stáhnout plán (JSON)",
-        data=json.dumps(base_plan, ensure_ascii=False, indent=2),
-        file_name=f"plan_{date.today().isoformat()}.json",
-        mime="application/json"
-    )
+    st.download_button("⬇️ Stáhnout plán (JSON)", data=json.dumps(base_plan, ensure_ascii=False, indent=2),
+                       file_name=f"plan_{date.today().isoformat()}.json", mime="application/json")
