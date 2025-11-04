@@ -7,6 +7,8 @@ import requests
 from pypdf import PdfReader
 from PIL import Image
 import pytesseract
+import time
+from openai import RateLimitError, APIError
 
 # --- Embeddings & Vector DB ---
 import faiss
@@ -36,6 +38,32 @@ if "emb_model" not in st.session_state:
     # lazy-load kvůli paměti
     st.session_state.emb_model = None
 if "openai_client" not in st.session_state:
+    def safe_chat_completion(client, messages, model, temperature=0.2, max_retries=4):
+    """
+    Zavolá OpenAI Chat s automatickým retry při RateLimitError.
+    Exponenciální backoff: 1s, 2s, 4s, 8s…
+    """
+    delay = 1.0
+    for attempt in range(max_retries):
+        try:
+            return client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+            )
+        except RateLimitError:
+            if attempt == max_retries - 1:
+                raise
+            st.info(f"⏳ Limit API – zkouším znovu za {int(delay)}s…")
+            time.sleep(delay)
+            delay *= 2
+        except APIError:
+            if attempt == max_retries - 1:
+                raise
+            st.info("Dočasná chyba služby – opakuji požadavek…")
+            time.sleep(delay)
+            delay *= 2
+
     st.session_state.openai_client = OpenAI(api_key=OPENAI_API_KEY)
 if "assets_loaded" not in st.session_state:
     st.session_state.assets_loaded = False
@@ -282,12 +310,16 @@ with col1:
                 ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
             prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
             client = st.session_state.openai_client
-            resp = client.chat.completions.create(
-                model=MODEL_CHAT,
-                messages=[{"role":"system","content":SYS_RAG},
-                          {"role":"user","content":prompt}],
-                temperature=0.2,
-            )
+            resp = safe_chat_completion(
+    client=st.session_state.openai_client,
+    model=MODEL_CHAT,
+    messages=[
+        {"role":"system","content":SYS_RAG},
+        {"role":"user","content":prompt},
+    ],
+    temperature=0.2,
+)
+
             st.markdown(resp.choices[0].message.content)
 
 with col2:
@@ -319,12 +351,16 @@ with col2:
             age=age_group, city_desc=city_desc,
             micro_week=pz["micro_week"], deload=pz["deload"]
         )
-        resp = client.chat.completions.create(
-            model=MODEL_CHAT,
-            messages=[{"role":"system","content":SYS_PLAN},
-                      {"role":"user","content":prompt}],
-            temperature=0.3,
-        )
+       resp = safe_chat_completion(
+    client=st.session_state.openai_client,
+    model=MODEL_CHAT,
+    messages=[
+        {"role":"system","content":SYS_PLAN},
+        {"role":"user","content":prompt},
+    ],
+    temperature=0.3,
+)
+
         st.markdown(resp.choices[0].message.content)
 
     st.download_button(
@@ -333,4 +369,5 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json"
     )
+
 
