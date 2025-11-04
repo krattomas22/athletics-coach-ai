@@ -301,36 +301,40 @@ col1, col2 = st.columns([2,1])
 
 with col1:
     st.subheader("💬 Chat nad přednačtenými zdroji (assets)")
-    q = st.text_input("Zeptej se na cokoliv z metodiky…", placeholder="Např. Jak progresovat sprinty u U13 v zimě?")
+    q = st.text_input(
+        "Zeptej se na cokoliv z metodiky…",
+        placeholder="Např. Jak progresovat sprinty u U13 v zimě?"
+    )
 
     if st.button("Odeslat dotaz") and q.strip():
-    # 1) chybí klíč?
-    if st.session_state.openai_client is None:
-        st.warning("Nejdřív doplň `OPENAI_API_KEY` do Settings → Secrets.")
-    # 2) není postavený index?
-    elif st.session_state.index is None:
-        st.warning("Nejdřív načti zdroje z assets a postav index (tlačítko vlevo).")
-    # 3) všechno OK → vyhledat kontext a zavolat model
-    else:
-        topk = search_similar(q, k=6)
-        ctx_blocks = []
-        for d in topk:
-            meta = d["meta"]
-            ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
-            ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
+        # 1) chybí klíč?
+        if st.session_state.openai_client is None:
+            st.warning("Nejdřív doplň `OPENAI_API_KEY` do Settings → Secrets.")
+        # 2) není postavený index?
+        elif st.session_state.index is None:
+            st.warning("Nejdřív načti zdroje z assets a postav index (tlačítko vlevo).")
+        # 3) všechno OK → vyhledat kontext a zavolat model
+        else:
+            topk = search_similar(q, k=6)
+            ctx_blocks = []
+            for d in topk:
+                meta = d["meta"]
+                ref = f'{meta["source"]}{f" s.{meta["page"]}" if meta["page"] else ""}'
+                ctx_blocks.append(f"[{ref}] {d['text'][:800]}")
 
-        prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
+            prompt = USR_RAG.format(q=q, ctx="\n\n".join(ctx_blocks))
 
-        resp = safe_chat_completion(
-            client=st.session_state.openai_client,
-            model=MODEL_CHAT,
-            messages=[
-                {"role": "system", "content": SYS_RAG},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        st.markdown(resp.choices[0].message.content)
+            resp = safe_chat_completion(
+                client=st.session_state.openai_client,
+                model=MODEL_CHAT,
+                messages=[
+                    {"role": "system", "content": SYS_RAG},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            st.markdown(resp.choices[0].message.content)
+
 with col2:
     st.subheader("🌦️ Počasí & plán")
     try:
@@ -341,47 +345,42 @@ with col2:
         ctx = weather_context(w)
     except Exception:
         st.warning("Nelze načíst počasí – používám offline hodnoty.")
-        w, ctx = {"city": city, "temp": 10, "desc":"offline data", "wind":0}, "indoor"
+        w, ctx = {"city": city, "temp": 10, "desc": "offline data", "wind": 0}, "indoor"
 
     try:
         races = json.loads(races_str)
-    except:
+    except Exception:
         races = []
+
     pz = periodization(date.today(), None, micro_week, age_group)
     base_plan = generate_plan(age_group, ctx, pz, races)
 
     st.json(base_plan, expanded=False)
 
     if st.button("🧠 Vygenerovat čitelnou verzi"):
-        client = st.session_state.openai_client
         city_desc = f"{w['city']}: {w['desc']} ({w['temp']} °C)"
         prompt = USR_PLAN.format(
             base=json.dumps(base_plan, ensure_ascii=False, indent=2),
-            age=age_group, city_desc=city_desc,
-            micro_week=pz["micro_week"], deload=pz["deload"]
+            age=age_group,
+            city_desc=city_desc,
+            micro_week=pz["micro_week"],
+            deload=pz["deload"],
         )
-       resp = safe_chat_completion(
-    client=st.session_state.openai_client,
-    model=MODEL_CHAT,
-    messages=[
-        {"role":"system","content":SYS_PLAN},
-        {"role":"user","content":prompt},
-    ],
-    temperature=0.3,
-)
 
+        resp = safe_chat_completion(
+            client=st.session_state.openai_client,
+            model=MODEL_CHAT,
+            messages=[
+                {"role": "system", "content": SYS_PLAN},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
         st.markdown(resp.choices[0].message.content)
 
     st.download_button(
         "⬇️ Stáhnout plán (JSON)",
         data=json.dumps(base_plan, ensure_ascii=False, indent=2),
         file_name=f"plan_{date.today().isoformat()}.json",
-        mime="application/json"
+        mime="application/json",
     )
-
-
-
-
-
-
-
