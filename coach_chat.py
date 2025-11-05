@@ -431,14 +431,13 @@ with col2:
         st.success("✅ Tréninkový plán byl úspěšně vygenerován!")
         st.json(base_plan)
 
-    
-
     st.download_button(
-        "⬇️ Stáhnout plán (JSON)",
+        "📥 Stáhnout plán (JSON)",
         data=json.dumps(base_plan, ensure_ascii=False, indent=2),
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json",
     )
+
 
 
 
