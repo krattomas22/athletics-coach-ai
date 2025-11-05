@@ -412,48 +412,48 @@ with col2:
         races = []
 
     pz = periodization(date.today(), None, micro_week, age_group)
-    if generate_clicked:
-        with st.spinner("💪 Generuji plán podle nastavení..."):
+if generate_clicked:
+    with st.spinner("💪 Generuji plán podle nastavení..."):
         # 1) Načtení počasí
         weather = get_weather(city)
         ctx = "indoor" if weather and weather.get("indoor") else "outdoor"
-    
+        
         # 2) Periodizace
         pz = periodization(date.today(), None, micro_week, age_group)
-    
+        
         # 3) Vygeneruj plán
         base_plan = generate_plan(age_group, ctx, pz, races, focuses, sessions_per_week)
-    
+        
         # 4) Ulož do session (abychom mohli zobrazit později)
         st.session_state["generated_plan"] = base_plan
-    
+        
         # 5) Připrav prompt pro čitelnou verzi
         city_desc = (
-            f"{weather.get('city','')}: {weather.get('desc','')}"
-            + (f" ({weather.get('temp')} °C)" if weather and weather.get('temp') is not None else "")
+        f"{weather.get('city','')}: {weather.get('desc','')}"
+        + (f" ({weather.get('temp')} °C)" if weather and weather.get('temp') is not None else "")
         )
-    
+        
         prompt = USR_PLAN.format(
-            base=json.dumps(base_plan, ensure_ascii=False, indent=2),
-            age=age_group,
-            city_desc=city_desc,
-            micro_week=pz["micro_week"],
-            deload=pz["deload"],
+        base=json.dumps(base_plan, ensure_ascii=False, indent=2),
+        age=age_group,
+        city_desc=city_desc,
+        micro_week=pz["micro_week"],
+        deload=pz["deload"],
         )
-    
+        
         resp = safe_chat_completion(
-            client=st.session_state.openai_client,
-            model=MODEL_CHAT,
-            messages=[
-                {"role": "system", "content": SYS_PLAN},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
+        client=st.session_state.openai_client,
+        model=MODEL_CHAT,
+        messages=[
+        {"role": "system", "content": SYS_PLAN},
+        {"role": "user", "content": prompt},
+        ],
+        temperature=0.3,
         )
-    
-    # 6) Po skončení spinneru – výstup
-    st.success("✅ Tréninkový plán byl úspěšně vygenerován!")
-    st.markdown(resp.choices[0].message.content)
+        
+        # 6) Po skončení spinneru – výstup
+        st.success("✅ Tréninkový plán byl úspěšně vygenerován!")
+        st.markdown(resp.choices[0].message.content)
 
     st.download_button(
         "📥 Stáhnout plán (JSON)",
@@ -461,6 +461,7 @@ with col2:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json",
     )
+
 
 
 
