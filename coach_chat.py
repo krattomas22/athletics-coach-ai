@@ -353,7 +353,92 @@ st.sidebar.header("⚙️ Nastavení plánu")
 age_group = st.sidebar.selectbox("Věk/skupina", ["U11", "U13", "U15"], index=1)
 micro_week = st.sidebar.number_input("Týden mikrocyklu (1–4)", min_value=1, max_value=4, value=3)
 city = st.sidebar.text_input("Město (počasí)", value=DEFAULT_CITY)
-races_str = st.sidebar.text_area("Kalendář závodů (JSON list)", value='[{"date":"2025-11-22","disciplines":["60m","dálka"]}]')
+# --- Nové kolonky pro nastavení tréninku ---
+focus_opts = [
+    "rychlost", "technika sprintu", "vytrvalost",
+    "skok daleký", "skok vysoký", "vrhy/hody", "síla/CORE"
+]
+focuses = st.sidebar.multiselect(
+    "Zaměření týdne (vyber 1–3)", focus_opts,
+    default=["rychlost", "technika sprintu"]
+)
+
+sessions_per_week = st.sidebar.slider(
+    "Počet tréninků v týdnu", 1, 6, 3
+)
+
+races_str = st.sidebar.text_area(
+    "Kalendář závodů (JSON list)",
+    value='[{"date":"2025-11-22","disciplines":["60m","dálka"]}]'
+)
+# Fallbacky, kdyby uživatel nic nevybral
+focuses = focuses or ["rychlost"]
+sessions_per_week = int(sessions_per_week or 3)
+
+# Po kliknutí na tlačítko vygeneruj plán
+if generate_clicked:
+    with st.spinner("💪 Generuji plán podle nastavení..."):
+        # 1) Načtení počasí a kontext (indoor/outdoor)
+        w = get_weather(city)
+        ctx = "indoor" if (w and w.get("indoor")) else "outdoor"
+
+        # 2) Periodizace
+        pz = periodization(date.today(), None, micro_week, age_group)
+
+        # 3) Vygeneruj základní plán (JSON)
+        try:
+            base_plan = generate_plan(age_group, ctx, pz, races, focuses, sessions_per_week)
+        except TypeError:
+            # fallback pro starší signaturu generate_plan(age_group, ctx, pz, races)
+            base_plan = generate_plan(age_group, ctx, pz, races)
+
+        # 4) Ulož do session
+        st.session_state["generated_plan"] = base_plan
+
+        # 5) Připrav prompt a udělej čitelnou verzi (AI výstup)
+        city_desc = (
+            f"{w.get('city','')}: {w.get('desc','')}"
+            + (f" ({w.get('temp')} °C)" if w and w.get('temp') is not None else "")
+        )
+
+        prompt = USR_PLAN.format(
+            base=json.dumps(base_plan, ensure_ascii=False, indent=2),
+            age=age_group,
+            city_desc=city_desc,
+            micro_week=pz["micro_week"],
+            deload=pz["deload"],
+        )
+
+        resp = safe_chat_completion(
+            client=st.session_state.openai_client,
+            model=MODEL_CHAT,
+            messages=[
+                {"role": "system", "content": SYS_PLAN},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.3,
+        )
+
+    # 6) Výstup
+    st.success("✅ Tréninkový plán byl úspěšně vygenerován!")
+    st.markdown(resp.choices[0].message.content)
+
+    st.download_button(
+        "📥 Stáhnout plán (JSON)",
+        data=json.dumps(base_plan, ensure_ascii=False, indent=2),
+        file_name=f"plan_{date.today().isoformat()}.json",
+        mime="application/json",
+    )
+
+# Parse závodů (bezpečně)
+try:
+    races = json.loads(races_str) if races_str.strip() else []
+    if not isinstance(races, list):
+        raise ValueError("Races must be a JSON list.")
+except Exception as e:
+    st.sidebar.error(f"Chyba v JSONu závodů: {e}")
+    races = []
+
 generate_clicked = st.sidebar.button("💪 Vygenerovat plán", type="primary")
 # ========== HLAVNÍ – CHAT ==========
 col1, col2 = st.columns([2,1])
@@ -461,6 +546,7 @@ if generate_clicked:
         file_name=f"plan_{date.today().isoformat()}.json",
         mime="application/json",
     )
+
 
 
 
