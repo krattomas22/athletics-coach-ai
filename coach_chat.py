@@ -413,7 +413,7 @@ with col2:
 
     pz = periodization(date.today(), None, micro_week, age_group)
     if generate_clicked:
-    with st.spinner("💪 Generuji plán podle nastavení..."):
+        with st.spinner("💪 Generuji plán podle nastavení..."):
         # 1) Načtení počasí
         weather = get_weather(city)
         ctx = "indoor" if weather and weather.get("indoor") else "outdoor"
@@ -459,6 +459,7 @@ with col2:
         "📥 Stáhnout plán (JSON)",
         data=json.dumps(base_plan, ensure_ascii=False, indent=2),
         f
+
 
 
 
